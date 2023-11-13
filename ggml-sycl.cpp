@@ -989,7 +989,8 @@ static void *ggml_sycl_pool_malloc(size_t size, size_t *actual_size) {
     b.size = 0;
     clReleaseMemObject(mem);
   }
-  auto device_ptr = malloc_shared(size, queue);
+  auto device_ptr =
+      (void *)aligned_alloc_device(DEVICE_MEM_ALIGNMENT, size, queue);
   *actual_size = size;
   return device_ptr;
 }
