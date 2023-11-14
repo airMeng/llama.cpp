@@ -1040,15 +1040,12 @@ static void ggml_sycl_h2d_tensor_2d(sycl::queue q, sycl_mem dst, size_t offset,
     return;
   }
   if (nb0 == ts) {
-    const size_t dst_off[3] = {offset, 0, 0};
-    const size_t src_off[3] = {0, 0, 0};
-    syclcompat::memcpy_async(dst, dst_off, x, src_off, row_size, ne1, q);
+    q.ext_oneapi_memcpy2d(dst + offset, row_size, x, nb1, row_size, ne1, q);
     return;
   }
   for (uint64_t i1 = 0; i1 < ne1; i1++) {
-    const size_t dst_off[3] = {offset + i1 * row_size, 0, 0};
-    const size_t src_off[3] = {0, 0, 0};
-    syclcompat::memcpy_async(dst, dst_off, x, src_off, ts, ne0 / bs, q);
+    q.ext_oneapi_memcpy2d(dst + offset + i1 * row_size, ts, x + i1 * nb1, nb0,
+                          ts, ne0 / bs, q);
   }
   return;
 }
