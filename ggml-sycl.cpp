@@ -6,11 +6,20 @@
 #include <sstream>
 #include <vector>
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <CL/sycl.hpp>
+#include <assert.h>
+#include <chrono>
+#include <cstring>
+#include <iostream>
+#include <math.h>
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/sycl.hpp>
+#include <vector>
 
 #include "ggml.h"
 
@@ -18,68 +27,336 @@
 #pragma warning(disable : 4244 4267) // possible loss of data
 #endif
 
-using namespace cl::sycl;
+#include "xetla.hpp"
 
-typedef char int8_t;
-typedef uchar uint8_t;
-typedef short int16_t;
-typedef ushort uint16_t;
-typedef int int32_t;
-typedef uint uint32_t;
+#define DEVICE_MEM_ALIGNMENT (64)
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+
+using fp16 = sycl::half;
+using bf16 = sycl::_V1::ext::oneapi::bfloat16;
+using int4x2 = gpu::xetla::int4x2;
+
+static sycl::property_list properties{
+    sycl::property::queue::enable_profiling()};
+static sycl::queue CQ;
+
+void ggml_sycl_init(void) {
+  std::cout << "Running on "
+            << CQ.get_info<sycl::info::queue::device>()
+                   .get_info<sycl::info::device::name>()
+            << "\n";
+}
+
+static constexpr gpu::xetla::mem_layout layout_a =
+    gpu::xetla::mem_layout::row_major;
+static constexpr gpu::xetla::mem_layout layout_b =
+    gpu::xetla::mem_layout::row_major;
+
+struct linear_param {
+  int dequant_s;
+  uint32_t matrix_m;
+  uint32_t matrix_n;
+  uint32_t matrix_k;
+  size_t size_a;
+  size_t size_b;
+  size_t size_scale_m;
+  size_t size_scale_n;
+  size_t size_scale;
+  size_t size_zero_pt_m;
+  size_t size_zero_pt_n;
+  size_t size_zero_pt;
+  size_t size_c;
+  size_t size_d;
+  size_t size_acc;
+  size_t size_cnt;
+  linear_param(uint32_t m, uint32_t n, uint32_t k, int blk)
+      : matrix_m(m), matrix_n(n), matrix_k(k), dequant_s(blk) {
+    size_a = matrix_m * matrix_k;
+    size_b = matrix_k * matrix_n / 2;
+    size_d = 1 * matrix_n;
+    size_scale_m = matrix_k / dequant_s;
+    size_scale_n = matrix_n;
+    size_scale = size_scale_m * size_scale_n;
+    size_zero_pt_m = matrix_k / dequant_s;
+    size_zero_pt_n = matrix_n / 2;
+    size_zero_pt = size_zero_pt_m * size_zero_pt_n;
+    size_c = matrix_m * matrix_n;
+  }
+};
+
+template <size_t wg_m_ = 8, size_t wg_n_ = 16, size_t sg_m_ = 8,
+          size_t sg_n_ = 32, size_t sg_k_ = 16, size_t slm_k_ = 2,
+          size_t pf_ = 3, size_t sync_ = 0, size_t bs_ = 1>
+struct GemmPolicyT {
+  static size_t wg_m = wg_m;
+  static size_t wg_n = wg_n_;
+  static size_t sg_m = sg_m_;
+  static size_t sg_n = sg_n_;
+  static size_t sg_k = sg_k_;
+  static size_t slm_k = slm_k_;
+  static size_t pf = pf_;
+  static size_t sync = sync_;
+  static size_t bs = bs_;
+  operator==(const GemmPolicyT &other) const {
+    return wg_m_ == other.wg_m_ && wg_n_ == other.wg_n_ &&
+               sg_m_ == other.sg_m_ && sg_n_ == other.sg_n_ &&
+               sg_k_ == other.sg_k && slm_k_ == other.slm_k_ &&
+               pf_ == other.pf_ && sync_ == other.sync_ && bs_ = other.bs_;
+  }
+};
+
+template <typename POLICY_, typename ACT_T, typename WEI_T, typename ACC_T>
+void xetla_linear(sycl::queue queue, ACT_T *A, WEI_T *B, ACT_T *C,
+                  uint32_t matrix_m, uint32_t matrix_n, uint32_t matrix_k,
+                  ACC_T Bias) {
+  using data_type_a = ACT_T;
+  using data_type_c = ACT_T;
+  using data_type_acc = ACC_T;
+  linear_param p(matrix_m, matrix_n, matrix_k, dequant_s);
+  auto context = queue.get_info<sycl::info::queue::context>();
+  auto device = queue.get_info<sycl::info::queue::device>();
+
+  using gemm_policy = POLICY_;
+  using mem_desc_a_t =
+      gpu::xetla::mem_desc_t<data_type_a, gpu::xetla::mem_layout::row_major,
+                             gpu::xetla::mem_space::global>;
+  using mem_desc_b_t =
+      gpu::xetla::mem_desc_t<data_type_b, gpu::xetla::mem_layout::row_major,
+                             gpu::xetla::mem_space::global>;
+  using mem_desc_c_t =
+      gpu::xetla::mem_desc_t<data_type_c, gpu::xetla::mem_layout::row_major,
+                             gpu::xetla::mem_space::global>;
+
+  using tile_shape =
+      gpu::xetla::group::tile_shape_t<gemm_policy.wg_m, gemm_policy.wg_n,
+                                      gemm_policy.sg_m, gemm_policy.sg_n>;
+  using compute_attr = using compute_attr =
+      gpu::xetla::group::compute_attr_t<data_type_acc_in, data_type_acc_in,
+                                        data_type_acc>;
+  using perf_tuning_knob =
+      gpu::xetla::group::perf_tuning_knob_t<gemm_policy.sg_k, gemm_policy.pf,
+                                            gemm_policy.sync>;
+  using group_swizzle =
+      gpu::xetla::kernel::group_swizzle_default<gpu::xetla::gpu_arch::Arc>;
+  if constexpr (gemm_policy.bs != 1) {
+    using compute_policy =
+        gpu::xetla::group::compute_policy_bit4_dequantize_xmx<
+            compute_attr, perf_tuning_knob,
+            gpu::xetla::group::quant_type::S4_FULLRANGE, data_type_scale,
+            dequant_s, gpu::xetla::gpu_arch::Arc>;
+    using dispatch_policy =
+        gpu::xetla::kernel::dispatch_policy_int4_dequantize_kslicing<
+            group_swizzle, 1, gemm_policy.slm_k>;
+    using gemm_t = gpu::xetla::group::gemm_t<compute_policy, tile_shape,
+                                             mem_desc_a_t, mem_desc_b_t>;
+    using epilogue_t = gpu::xetla::group::epilogue_t<
+        gpu::xetla::group::epilogue_policy_unaligned<gpu::xetla::gpu_arch::Arc>,
+        tile_shape, mem_desc_c_t>;
+    using gemm_op_t = gpu::xetla::kernel::gemm_universal_t<dispatch_policy,
+                                                           gemm_t, epilogue_t>;
+    p.size_acc = gemm_op_t::get_acc_buf_size(p.matrix_m, p.matrix_n);
+    p.size_cnt = gemm_op_t::get_cnt_buf_size(p.matrix_m, p.matrix_n);
+
+    auto *Acc_d = static_cast<data_type_acc *>(aligned_alloc_device(
+        DEVICE_MEM_ALIGNMENT, p.size_acc * sizeof(data_type_acc), device,
+        context));
+    auto *Cnt_d = static_cast<uint32_t *>(aligned_alloc_device(
+        DEVICE_MEM_ALIGNMENT, p.size_cnt * sizeof(uint32_t), device, context));
+
+    // set up gemm arguments
+    typename gemm_op_t::arguments_t gemm_arg(
+        p.matrix_m, p.matrix_k, p.matrix_n, static_cast<data_type_a *>(A),
+        p.matrix_k, static_cast<data_type_b *>(B->get_4bit_wei_ptr_device()),
+        p.matrix_n, static_cast<data_type_c *>(C), p.matrix_n,
+        static_cast<data_type_scale *>(B->get_scale_ptr_device()), p.matrix_n,
+        Acc_d, Cnt_d);
+    cl::sycl::nd_range<3> nd_range = gemm_op_t::get_nd_range(gemm_arg);
+    if (!gemm_op_t::can_implement(gemm_arg)) {
+      std::cout << "The arguments cannot be supported, aborting ... "
+                << std::endl;
+      exit(0);
+    }
+    size_t ops = 2 * p.matrix_m * p.matrix_n * p.matrix_k;
+    auto e_esimd = queue.submit([&](sycl::handler &cgh) {
+      cgh.parallel_for(nd_range, [=](sycl::nd_item<3> item) SYCL_ESIMD_KERNEL {
+        // allocate slm and nbarrier resource
+        gpu::xetla::slm_barrier_init<gemm_op_t>();
+        gemm_op_t gemm_op;
+        gemm_op(item, gemm_arg);
+      });
+    });
+    e_esimd.wait();
+
+    free(Acc_d, context);
+    free(Cnt_d, context);
+
+  } else {
+    using compute_policy =
+        compute_policy_unaligned_xmx<compute_attr, perf_tuning_knob,
+                                     gpu_arch::Arc>;
+    using dispatch_policy = gpu::xetla::kernel::dispatch_policy_kslicing<
+        group_swizzle, num_global_splitk, num_local_splitk>;
+    using gemm_t = gpu::xetla::group::gemm_t<compute_policy, tile_shape,
+                                             mem_desc_a_t, mem_desc_b_t>;
+    using epilogue_t = gpu::xetla::group::epilogue_t<
+        gpu::xetla::group::epilogue_policy_unaligned<gpu::xetla::gpu_arch::Arc>,
+        tile_shape, mem_desc_c_t>;
+    using gemm_op_t = gpu::xetla::kernel::gemm_universal_t<dispatch_policy,
+                                                           gemm_t, epilogue_t>;
+    p.size_acc = gemm_op_t::get_acc_buf_size(p.matrix_m, p.matrix_n);
+    p.size_cnt = gemm_op_t::get_cnt_buf_size(p.matrix_m, p.matrix_n);
+
+    auto *Acc_d = static_cast<data_type_acc *>(aligned_alloc_device(
+        DEVICE_MEM_ALIGNMENT, p.size_acc * sizeof(data_type_acc), device,
+        context));
+    auto *Cnt_d = static_cast<uint32_t *>(aligned_alloc_device(
+        DEVICE_MEM_ALIGNMENT, p.size_cnt * sizeof(uint32_t), device, context));
+
+    // set up gemm arguments
+    typename gemm_op_t::arguments_t gemm_arg(
+        p.matrix_m, p.matrix_k, p.matrix_n, static_cast<data_type_a *>(A),
+        p.matrix_k, static_cast<data_type_b *>(B), p.matrix_n,
+        static_cast<data_type_c *>(C), p.matrix_n, Acc_d, Cnt_d);
+    cl::sycl::nd_range<3> nd_range = gemm_op_t::get_nd_range(gemm_arg);
+    if (!gemm_op_t::can_implement(gemm_arg)) {
+      std::cout << "The arguments cannot be supported, aborting ... "
+                << std::endl;
+      exit(0);
+    }
+
+    size_t ops = 2 * p.matrix_m * p.matrix_n * p.matrix_k;
+    auto e_esimd = queue.submit([&](sycl::handler &cgh) {
+      cgh.parallel_for(nd_range, [=](sycl::nd_item<3> item) SYCL_ESIMD_KERNEL {
+        // allocate slm and nbarrier resource
+        gpu::xetla::slm_barrier_init<gemm_op_t>();
+        gemm_op_t gemm_op;
+        gemm_op(item, gemm_arg);
+      });
+    });
+    e_esimd.wait();
+
+    free(Acc_d, context);
+    free(Cnt_d, context);
+  }
+};
+
+template <typename ACT_T, typename WEI_T, typename ACC_T>
+void xetla_linear_normal(sycl::queue queue, ACT_T *A, WEI_T *B, ACT_T *C,
+                         uint32_t matrix_m, uint32_t matrix_n,
+                         uint32_t matrix_k, ACC_T *D) {
+
+  GemmShapeT shape = {matrix_m, matrix_n, matrix_k};
+  switch (shape) {
+  case {1, 4096, 4096}:
+    return xetla_linear_impl<GemmPolicyT<16, 32, 16, 64, 32, 4, 3, 1, 1>, ACT_T,
+                             WEI_T, ACC_T>(queue, A, B, C, matrix_m, matrix_n,
+                                           matrix_k, D);
+  default:
+    return xetla_linear_impl<GemmPolicyT, ACT_T, WEI_T, ACC_T>(
+        queue, A, B, C, matrix_m, matrx_n, matrix_k, D);
+  }
+}
+template <typename ACT_T, typename WEI_T, typename ACC_T>
+void xetla_linear_low_bits(sycl::queue queue, ACT_T *A, WEI_T *B, ACT_T *C,
+                           uint32_t matrix_m, uint32_t matrix_n,
+                           uint32_t matrix_k, int dequant_s, ACC_T *D) {
+  static_assert(dequant_s <= matrix_k && matrix_k % dequant_s == 0,
+                "dequant_s must not bigger than matrix_k and matrix_k must be "
+                "devisible by dequant_s");
+  using compute_attr =
+      gpu::xetla::group::compute_attr_t<data_type_a, data_type_b,
+                                        data_type_acc>;
+
+  // GemmShapeT shape = {matrix_m, matrix_n, matrix_k, dequant_s};
+  switch (dequant_s) {
+  case {16}:
+    return xetla_linear_impl<GemmPolicyT<16, 32, 16, 64, 16, 2, 3, 1, 16>,
+                             ACT_T, WEI_T, ACC_T>(queue, A, B, C, matrix_m,
+                                                  matrx_n, matrix_k, D);
+  case {32}:
+    return xetla_linear_impl<GemmPolicyT<16, 32, 16, 64, 16, 2, 3, 1, 32>,
+                             ACT_T, WEI_T, ACC_T>(queue, A, B, C, matrix_m,
+                                                  matrx_n, matrix_k, D);
+  case {64}:
+    return xetla_linear_impl<GemmPolicyT<16, 32, 16, 64, 64, 2, 3, 1, 64>,
+                             ACT_T, WEI_T, ACC_T>(queue, A, B, C, matrix_m,
+                                                  matrx_n, matrix_k, D);
+  case {128}:
+    return xetla_linear_impl<GemmPolicyT<16, 32, 16, 64, 32, 2, 3, 1, 128>,
+                             ACT_T, WEI_T, ACC_T>(queue, A, B, C, matrix_m,
+                                                  matrx_n, matrix_k, D);
+  default:
+    printf("only support block_size = 16, 32, 64, 128\n");
+    exit(0);
+  }
+}
+
+template <typename ACT_T, typename WEI_T, typename ACC_T>
+void xetla_linear(sycl::queue queue, ACT_T *A, WEI_T *B, ACT_T *C,
+                  uint32_t matrix_m, uint32_t matrix_n, uint32_t matrix_k,
+                  int dequant_s, ACC_T *bias) {
+  if constexpr (sizeof(WEI_T) < 8) {
+    return xetla_linear_low_bits<ACt_T, WEI_T, ACC_T>(
+        queue, A, B, C, matrix_m, matrix_n, matrix_k, dequant_s, bias);
+  } else {
+    return xetla_linear_normal<ACt_T, WEI_T, ACC_T>(queue, A, B, C, matrix_m,
+                                                    matrix_n, matrix_k, bias);
+  }
+}
 
 struct __attribute__((packed)) block_q4_0 {
-  half d;
+  fp16 d;
   uint8_t qs[QK4_0 / 2];
 };
 
 struct __attribute__((packed)) block_q4_1 {
-  half d;
-  half m;
+  fp16 d;
+  fp16 m;
   uint8_t qs[QK4_1 / 2];
 };
 
 struct __attribute__((packed)) block_q5_0 {
-  half d;
+  fp16 d;
   uint32_t qh;
   uint8_t qs[QK5_0 / 2];
 };
 
 struct __attribute__((packed)) block_q5_1 {
-  half d;
-  half m;
+  fp16 d;
+  fp16 m;
   uint32_t qh;
   uint8_t qs[QK5_1 / 2];
 };
 
 struct __attribute__((packed)) block_q8_0 {
-  half d;
+  fp16 d;
   int8_t qs[QK8_0];
 };
 
 struct __attribute__((packed)) block_q2_K {
   uint8_t scales[16];
   uint8_t qs[64];
-  half d;
-  half dmin;
+  fp16 d;
+  fp16 dmin;
 };
 
 struct __attribute__((packed)) block_q3_K {
   uint8_t hmask[32];
   uint8_t qs[64];
   uint8_t scales[12];
-  half d;
+  fp16 d;
 };
 
 struct __attribute__((packed)) block_q4_K {
-  half d;
-  half dmin;
+  fp16 d;
+  fp16 dmin;
   uint8_t scales[12];
   uint8_t qs[128];
 };
 
 struct __attribute__((packed)) block_q5_K {
-  half d;
-  half dmin;
+  fp16 d;
+  fp16 dmin;
   uint8_t scales[12];
   uint8_t qh[32];
   uint8_t qs[128];
@@ -89,18 +366,18 @@ struct __attribute__((packed)) block_q6_K {
   uint8_t ql[128];
   uint8_t qh[64];
   int8_t scales[16];
-  half d;
+  fp16 d;
 };
 
-__kernel void convert_fp16_to_fp32(__global half *x, __global float *y) {
+__kernel void convert_fp16_to_fp32(__global fp16 *x, __global float *y) {
   const uint i = get_global_id(0);
 
-  y[i] = vload_half(0, &x[i]);
+  y[i] = vload_fp16(0, &x[i]);
 }
 
 void dequantize_q4_0(__global const struct block_q4_0 *x, const int ib,
                      const int iqs, float *v0, float *v1) {
-  const float d = vload_half(0, &x[ib].d);
+  const float d = vload_fp16(0, &x[ib].d);
 
   const uint8_t vui = x[ib].qs[iqs];
 
@@ -112,8 +389,8 @@ void dequantize_q4_0(__global const struct block_q4_0 *x, const int ib,
 }
 void dequantize_q4_1(__global const struct block_q4_1 *x, const int ib,
                      const int iqs, float *v0, float *v1) {
-  const float d = vload_half(0, &x[ib].d);
-  const float m = vload_half(0, &x[ib].m);
+  const float d = vload_fp16(0, &x[ib].d);
+  const float m = vload_fp16(0, &x[ib].m);
 
   const uint8_t vui = x[ib].qs[iqs];
 
@@ -125,7 +402,7 @@ void dequantize_q4_1(__global const struct block_q4_1 *x, const int ib,
 }
 void dequantize_q5_0(__global const struct block_q5_0 *x, const int ib,
                      const int iqs, float *v0, float *v1) {
-  const float d = vload_half(0, &x[ib].d);
+  const float d = vload_fp16(0, &x[ib].d);
 
   uint32_t qh = x[ib].qh;
 
@@ -140,8 +417,8 @@ void dequantize_q5_0(__global const struct block_q5_0 *x, const int ib,
 }
 void dequantize_q5_1(__global const struct block_q5_1 *x, const int ib,
                      const int iqs, float *v0, float *v1) {
-  const float d = vload_half(0, &x[ib].d);
-  const float m = vload_half(0, &x[ib].m);
+  const float d = vload_fp16(0, &x[ib].d);
+  const float m = vload_fp16(0, &x[ib].m);
 
   uint32_t qh = x[ib].qh;
 
@@ -156,7 +433,7 @@ void dequantize_q5_1(__global const struct block_q5_1 *x, const int ib,
 }
 void dequantize_q8_0(__global const struct block_q8_0 *x, const int ib,
                      const int iqs, float *v0, float *v1) {
-  const float d = vload_half(0, &x[ib].d);
+  const float d = vload_fp16(0, &x[ib].d);
 
   const int8_t vi0 = x[ib].qs[iqs + 0];
   const int8_t vi1 = x[ib].qs[iqs + 1];
@@ -164,10 +441,10 @@ void dequantize_q8_0(__global const struct block_q8_0 *x, const int ib,
   *v0 = vi0 * d;
   *v1 = vi1 * d;
 }
-void convert_f16(__global half *x, const int ib, const int iqs, float *v0,
+void convert_f16(__global fp16 *x, const int ib, const int iqs, float *v0,
                  float *v1) {
-  *v0 = vload_half(0, &x[ib + 0]);
-  *v1 = vload_half(0, &x[ib + 1]);
+  *v0 = vload_fp16(0, &x[ib + 0]);
+  *v1 = vload_fp16(0, &x[ib + 1]);
 }
 
 inline void get_scale_min_k4(int j, const __global uint8_t *q, uint8_t *d,
@@ -192,8 +469,8 @@ __kernel void dequantize_block_q2_K(__global const struct block_q2_K *x,
   const uint8_t q = x[i].qs[32 * n + l];
   __global float *y = yy + get_group_id(0) * QK_K + 128 * n;
 
-  const float dall = vload_half(0, &x[i].d);
-  const float dmin = vload_half(0, &x[i].dmin);
+  const float dall = vload_fp16(0, &x[i].d);
+  const float dmin = vload_fp16(0, &x[i].dmin);
 
   y[l + 0] = dall * (x[i].scales[is + 0] & 0xF) * ((q >> 0) & 3) -
              dmin * (x[i].scales[is + 0] >> 4);
@@ -227,7 +504,7 @@ __kernel void dequantize_block_q3_K(__global const struct block_q3_K *x,
                               (((x[i].scales[is + 0] >> 4) & 3) << 4)
                         : (x[i].scales[is - 8] >> 4) |
                               (((x[i].scales[is - 4] >> 6) & 3) << 4);
-  float d_all = vload_half(0, &x[i].d);
+  float d_all = vload_fp16(0, &x[i].d);
   float dl = d_all * (us - 32);
 
   __global float *y = yy + get_group_id(0) * QK_K + 128 * n + 32 * j;
@@ -249,8 +526,8 @@ __kernel void dequantize_block_q4_K(__global const struct block_q4_K *x,
 
   __global float *y = yy + get_group_id(0) * QK_K + 64 * il + n * ir;
 
-  const float dall = vload_half(0, &x[i].d);
-  const float dmin = vload_half(0, &x[i].dmin);
+  const float dall = vload_fp16(0, &x[i].d);
+  const float dmin = vload_fp16(0, &x[i].dmin);
 
   __global const uint8_t *q = x[i].qs + 32 * il + n * ir;
 
@@ -277,8 +554,8 @@ __kernel void dequantize_block_q5_K(__global const struct block_q5_K *x,
 
   __global float *y = yy + get_group_id(0) * QK_K + 64 * il + 2 * ir;
 
-  const float dall = vload_half(0, &x[i].d);
-  const float dmin = vload_half(0, &x[i].dmin);
+  const float dall = vload_fp16(0, &x[i].d);
+  const float dmin = vload_fp16(0, &x[i].dmin);
 
   __global const uint8_t *ql = x[i].qs + 32 * il + 2 * ir;
   __global const uint8_t *qh = x[i].qh + 2 * ir;
@@ -309,7 +586,7 @@ __kernel void dequantize_block_q6_K(__global const struct block_q6_K *x,
 
   __global float *y = yy + get_group_id(0) * QK_K + 128 * ip + il;
 
-  const float d = vload_half(0, &x[i].d);
+  const float d = vload_fp16(0, &x[i].d);
 
   __global const uint8_t *ql = x[i].ql + 64 * ip + il;
   const uint8_t qh = x[i].qh[32 * ip + il];
@@ -358,8 +635,8 @@ __kernel void dequantize_mul_mat_vec_q2_K(__global const struct block_q2_K *xx,
     __global const float *y = yy + i * QK_K + y_offset;
     __global const uint8_t *q = x[i].qs + q_offset;
 
-    const float dall = vload_half(0, &x[i].d);
-    const float dmin = vload_half(0, &x[i].dmin);
+    const float dall = vload_fp16(0, &x[i].d);
+    const float dmin = vload_fp16(0, &x[i].dmin);
 
     __global const uint32_t *a =
         (__global const uint32_t *)(x[i].scales + s_offset);
@@ -450,7 +727,7 @@ __kernel void dequantize_mul_mat_vec_q3_K(__global const struct block_q3_K *xx,
     utmp[3] = ((a[3] >> s_shift) & kmask2) |
               (((a[5] >> (s_shift + 2)) & kmask1) << 4);
 
-    const float d = vload_half(0, &x[i].d);
+    const float d = vload_fp16(0, &x[i].d);
 
     float sum = 0;
     for (int l = 0; l < n; ++l) {
@@ -533,8 +810,8 @@ __kernel void dequantize_mul_mat_vec_q4_K(__global const struct block_q4_K *xx,
     __global const float *y1 = yy + i * QK_K + y_offset;
     __global const float *y2 = y1 + 128;
 
-    const float dall = vload_half(0, &x[i].d);
-    const float dmin = vload_half(0, &x[i].dmin);
+    const float dall = vload_fp16(0, &x[i].d);
+    const float dmin = vload_fp16(0, &x[i].dmin);
 
     __global const uint16_t *a = (__global const uint16_t *)x[i].scales;
     aux[0] = a[im + 0] & kmask1;
@@ -617,8 +894,8 @@ __kernel void dequantize_mul_mat_vec_q5_K(__global const struct block_q5_K *xx,
     __global const float *y1 = yy + i * QK_K + y_offset;
     __global const float *y2 = y1 + 128;
 
-    const float dall = vload_half(0, &x[i].d);
-    const float dmin = vload_half(0, &x[i].dmin);
+    const float dall = vload_fp16(0, &x[i].d);
+    const float dmin = vload_fp16(0, &x[i].dmin);
 
     __global const uint16_t *a = (__global const uint16_t *)x[i].scales;
     aux[0] = a[im + 0] & kmask1;
@@ -712,7 +989,7 @@ __kernel void dequantize_mul_mat_vec_q6_K(__global const struct block_q6_K *xx,
     __global const uint8_t *qh = x[i].qh + qh_offset;
     __global const int8_t *s = x[i].scales + s_offset;
 
-    const float d = vload_half(0, &x[i].d);
+    const float d = vload_fp16(0, &x[i].d);
 
     \n #if K_QUANTS_PER_ITERATION == 1\n float sum =
         y[0] * s[0] * d *
@@ -869,7 +1146,7 @@ std::array<std::string, 30> dequant_str_values = {"dequantize_row_q4_0",
                                                   "QR8_0",
                                                   "dequantize_q8_0",
                                                   "convert_row_f16",
-                                                  "half",
+                                                  "fp16",
                                                   "1",
                                                   "1",
                                                   "convert_f16"};
@@ -901,7 +1178,7 @@ std::array<std::string, 30> dequant_mul_mat_vec_str_values = {
     "QR8_0",
     "dequantize_q8_0",
     "convert_mul_mat_vec_f16",
-    "half",
+    "fp16",
     "1",
     "1",
     "convert_f16"};
@@ -917,15 +1194,6 @@ static std::string &replace(std::string &s, const std::string &from,
     pos += to.length();
   }
   return s;
-}
-
-static sycl::property_list properties{
-    sycl::property::queue::enable_profiling()};
-static sycl::queue queue;
-static info::queue::context context = queue.get_info<info::queue::context>();
-
-void ggml_sycl_init(void) {
-  std::cout << "Running on " << device.get_info<info::device::name>() << "\n";
 }
 
 // buffer pool for cl
@@ -954,7 +1222,6 @@ static std::atomic_flag g_sycl_pool_lock = ATOMIC_FLAG_INIT;
 
 static void *ggml_sycl_pool_malloc(size_t size, size_t *actual_size) {
   scoped_spin_lock lock(g_sycl_pool_lock);
-  sycl_int err;
 
   int best_i = -1;
   size_t best_size =
@@ -987,10 +1254,10 @@ static void *ggml_sycl_pool_malloc(size_t size, size_t *actual_size) {
     sycl_buffer &b = g_sycl_buffer_pool[worst_i];
     sycl_mem mem = b.mem;
     b.size = 0;
-    clReleaseMemObject(mem);
+    sycl::free(mem, CQ);
   }
   auto device_ptr =
-      (void *)aligned_alloc_device(DEVICE_MEM_ALIGNMENT, size, queue);
+      (void *)aligned_alloc_device(DEVICE_MEM_ALIGNMENT, size, CQ);
   *actual_size = size;
   return device_ptr;
 }
@@ -1007,7 +1274,7 @@ static void ggml_sycl_pool_free(sycl_mem mem, size_t size) {
     }
   }
   fprintf(stderr, "WARNING: cl buffer pool full, increase MAX_CL_BUFFERS\n");
-  sycl::free(mem);
+  sycl::free(mem, CQ);
 }
 
 void ggml_sycl_free_data(const struct ggml_tensor *tensor) {
@@ -1016,13 +1283,12 @@ void ggml_sycl_free_data(const struct ggml_tensor *tensor) {
   }
 
   sycl_mem mem = (sycl_mem)tensor->extra;
-  sycl::free(mem);
+  sycl::free(mem, CQ);
 }
 
-static void ggml_sycl_h2d_tensor_2d(sycl::queue q, sycl_mem dst, size_t offset,
+static void ggml_sycl_h2d_tensor_2d(sycl_mem dst, size_t offset,
                                     const struct ggml_tensor *src, uint64_t i3,
-                                    uint64_t i2, sycl_event *ev) {
-  sycl_int err;
+                                    uint64_t i2) {
   const uint64_t ne0 = src->ne[0];
   const uint64_t ne1 = src->ne[1];
   const uint64_t nb0 = src->nb[0];
@@ -1036,16 +1302,16 @@ static void ggml_sycl_h2d_tensor_2d(sycl::queue q, sycl_mem dst, size_t offset,
 
   const char *x = (const char *)src->data + i2 * nb2 + i3 * nb3;
   if (nb0 == ts && nb1 == row_size) {
-    q.memcpy(dst + offset, x, ne1 * row_size);
+    CQ.memcpy(dst + offset, x, ne1 * row_size);
     return;
   }
   if (nb0 == ts) {
-    q.ext_oneapi_memcpy2d(dst + offset, row_size, x, nb1, row_size, ne1, q);
+    CQ.ext_oneapi_memcpy2d(dst + offset, row_size, x, nb1, row_size, ne1);
     return;
   }
   for (uint64_t i1 = 0; i1 < ne1; i1++) {
-    q.ext_oneapi_memcpy2d(dst + offset + i1 * row_size, ts, x + i1 * nb1, nb0,
-                          ts, ne0 / bs, q);
+    CQ.ext_oneapi_memcpy2d(dst + offset + i1 * row_size, ts, x + i1 * nb1, nb0,
+                           ts, ne0 / bs);
   }
   return;
 }
@@ -1075,10 +1341,9 @@ static void ggml_sycl_mul_f32(const ggml_tensor *src0, const ggml_tensor *src1,
 
   for (int64_t i03 = 0; i03 < ne03; i03++) {
     for (int64_t i02 = 0; i02 < ne02; i02++) {
-      sycl_event ev;
 
       // copy src0 to device
-      CL_CHECK(ggml_sycl_h2d_tensor_2d(queue, d_X, 0, src0, i03, i02, &ev));
+      CL_CHECK(ggml_sycl_h2d_tensor_2d(queue, d_X, 0, src0, i03, i02));
 
       const int64_t i13 = i03 % ne13;
       const int64_t i12 = i02 % ne12;
@@ -1303,7 +1568,7 @@ static void ggml_sycl_mul_mat_f16(const ggml_tensor *src0,
 
           // compute
           sycl_event ev_sgemm;
-          clblast::StatusCode status = clblast::Gemm<cl_half>(
+          clblast::StatusCode status = clblast::Gemm<cl_fp16>(
               clblast::Layout::kColMajor, clblast::Transpose::kYes,
               clblast::Transpose::kNo, ne01, ne11, ne10, alpha, d_X, x_offset,
               ne00, d_Y, 0, ne10, beta, d_D, 0, ne01, &queue, &ev_sgemm);
@@ -1523,8 +1788,8 @@ static bool ggml_sycl_mul_mat_use_f16(const struct ggml_tensor *src0,
       src0_sz + sizeof(ggml_fp16_t) * ggml_nelements(src1);
 
   // choose the smaller one to transfer to the device
-  // TODO: this is not always the best choice due to the overhead of converting
-  // to fp16
+  // TODO: this is not always the best choice due to the overhead of
+  // converting to fp16
   return mul_mat_f16_transfer < mul_mat_q_transfer;
 }
 
