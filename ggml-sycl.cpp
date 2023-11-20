@@ -48,9 +48,9 @@ void ggml_sycl_init(void) {
 }
 
 static constexpr gpu::xetla::mem_layout layout_a =
-    gpu::xetla::mem_layout::row_major;
+    gpu::xetla::mem_layout::col_major; // transposed weight
 static constexpr gpu::xetla::mem_layout layout_b =
-    gpu::xetla::mem_layout::row_major;
+    gpu::xetla::mem_layout::row_major; // activation
 
 struct linear_param {
   int dequant_s;
@@ -106,7 +106,7 @@ struct GemmPolicyT {
 };
 
 template <typename POLICY_, typename ACT_T, typename WEI_T, typename ACC_T>
-void xetla_linear(sycl::queue queue, ACT_T *A, WEI_T *B, ACT_T *C,
+void xetla_linear(sycl::queue queue, void *A, void *B, void *C,
                   uint32_t matrix_m, uint32_t matrix_n, uint32_t matrix_k,
                   ACC_T Bias) {
   using data_type_a = ACT_T;
@@ -241,9 +241,9 @@ void xetla_linear(sycl::queue queue, ACT_T *A, WEI_T *B, ACT_T *C,
 };
 
 template <typename ACT_T, typename WEI_T, typename ACC_T>
-void xetla_linear_normal(sycl::queue queue, ACT_T *A, WEI_T *B, ACT_T *C,
+void xetla_linear_normal(sycl::queue queue, void *A, void *B, void *C,
                          uint32_t matrix_m, uint32_t matrix_n,
-                         uint32_t matrix_k, ACC_T *D) {
+                         uint32_t matrix_k, void *D) {
 
   GemmShapeT shape = {matrix_m, matrix_n, matrix_k};
   switch (shape) {
@@ -257,9 +257,9 @@ void xetla_linear_normal(sycl::queue queue, ACT_T *A, WEI_T *B, ACT_T *C,
   }
 }
 template <typename ACT_T, typename WEI_T, typename ACC_T>
-void xetla_linear_low_bits(sycl::queue queue, ACT_T *A, WEI_T *B, ACT_T *C,
+void xetla_linear_low_bits(sycl::queue queue, void *A, void *B, void *C,
                            uint32_t matrix_m, uint32_t matrix_n,
-                           uint32_t matrix_k, int dequant_s, ACC_T *D) {
+                           uint32_t matrix_k, int dequant_s, void *D) {
   static_assert(dequant_s <= matrix_k && matrix_k % dequant_s == 0,
                 "dequant_s must not bigger than matrix_k and matrix_k must be "
                 "devisible by dequant_s");
@@ -292,9 +292,9 @@ void xetla_linear_low_bits(sycl::queue queue, ACT_T *A, WEI_T *B, ACT_T *C,
 }
 
 template <typename ACT_T, typename WEI_T, typename ACC_T>
-void xetla_linear(sycl::queue queue, ACT_T *A, WEI_T *B, ACT_T *C,
+void xetla_linear(sycl::queue queue, void *A, void *B, void *C,
                   uint32_t matrix_m, uint32_t matrix_n, uint32_t matrix_k,
-                  int dequant_s, ACC_T *bias) {
+                  int dequant_s, void *bias) {
   if constexpr (sizeof(WEI_T) < 8) {
     return xetla_linear_low_bits<ACt_T, WEI_T, ACC_T>(
         queue, A, B, C, matrix_m, matrix_n, matrix_k, dequant_s, bias);
@@ -1432,33 +1432,15 @@ static void ggml_sycl_mul_mat_f32(const ggml_tensor *src0,
           x_offset = (i03 * ne02 + i02) * x_ne;
         } else {
           // copy src0 to device
-          CL_CHECK(
-              ggml_sycl_h2d_tensor_2d(queue, d_X, 0, src0, i03, i02, NULL));
+          ggml_sycl_h2d_tensor_2d(d_X, 0, src0, i03, i02);
         }
 
         for (int64_t i12 = i02 * r2, e12 = i12 + r2; i12 < e12; i12++) {
           // copy src1 to device
-          CL_CHECK(
-              ggml_sycl_h2d_tensor_2d(queue, d_Y, 0, src1, i13, i12, NULL));
-
-          CL_CHECK(clFinish(queue));
-
-          // compute
-          sycl_event ev_sgemm;
-          clblast::StatusCode status = clblast::Gemm<cl_float>(
-              clblast::Layout::kColMajor, clblast::Transpose::kYes,
-              clblast::Transpose::kNo, ne01, ne11, ne10, alpha, d_X, x_offset,
-              ne00, d_Y, 0, ne10, beta, d_D, 0, ne01, &queue, &ev_sgemm);
-
-          if (status != clblast::StatusCode::kSuccess) {
-            GGML_ASSERT(false);
-          }
+          ggml_sycl_h2d_tensor_2d(d_Y, 0, src1, i13, i12);
 
           // copy dst to host
           float *d = (float *)((char *)dst->data + i12 * nb2 + i13 * nb3);
-          CL_CHECK(clEnqueueReadBuffer(queue, d_D, true, 0,
-                                       sizeof(float) * d_ne, d, 1, &ev_sgemm,
-                                       NULL));
         }
       }
     }
@@ -1474,7 +1456,6 @@ static void ggml_sycl_mul_mat_f32(const ggml_tensor *src0,
 static void ggml_sycl_mul_mat_f16(const ggml_tensor *src0,
                                   const ggml_tensor *src1, ggml_tensor *dst,
                                   void *wdata, size_t wsize) {
-  GGML_ASSERT(fp16_support);
 
   const int64_t ne00 = src0->ne[0];
   const int64_t ne01 = src0->ne[1];
@@ -1532,8 +1513,7 @@ static void ggml_sycl_mul_mat_f16(const ggml_tensor *src0,
           x_offset = (i03 * ne02 + i02) * x_ne;
         } else {
           // copy src0 to device
-          CL_CHECK(
-              ggml_sycl_h2d_tensor_2d(queue, d_X, 0, src0, i03, i02, NULL));
+          ggml_sycl_h2d_tensor_2d(d_X, 0, src0, i03, i02);
         }
 
         for (int64_t i12 = i02 * r2, e12 = i12 + r2; i12 < e12; i12++) {
@@ -1560,27 +1540,15 @@ static void ggml_sycl_mul_mat_f16(const ggml_tensor *src0,
           }
 
           // copy src1 to device
-          CL_CHECK(clEnqueueWriteBuffer(queue, d_Y, false, 0,
-                                        sizeof(ggml_fp16_t) * y_ne, tmp, 0,
-                                        NULL, NULL));
-
-          CL_CHECK(clFinish(queue));
+          CQ.memcpy(d_Y, tmp, sizeof(ggml_fp16_t) * y_ne);
+          CQ.wait();
 
           // compute
-          sycl_event ev_sgemm;
-          clblast::StatusCode status = clblast::Gemm<cl_fp16>(
-              clblast::Layout::kColMajor, clblast::Transpose::kYes,
-              clblast::Transpose::kNo, ne01, ne11, ne10, alpha, d_X, x_offset,
-              ne00, d_Y, 0, ne10, beta, d_D, 0, ne01, &queue, &ev_sgemm);
-
-          if (status != clblast::StatusCode::kSuccess) {
-            GGML_ASSERT(false);
-          }
+          xetla_linear<fp16, fp16, float>(CQ, d_D, d_X, d_Y, ne01, ne11, ne10,
+                                          -1, nullptr);
 
           // copy dst to host, then convert to float
-          CL_CHECK(clEnqueueReadBuffer(queue, d_D, true, 0,
-                                       sizeof(ggml_fp16_t) * d_ne, tmp, 1,
-                                       &ev_sgemm, NULL));
+          CQ.memcpy(tmp, d_D, sizeof(ggml_fp16_t) * d_ne);
 
           float *d = (float *)((char *)dst->data + i12 * nb2 + i13 * nb3);
 
@@ -1761,8 +1729,7 @@ bool ggml_sycl_can_mul_mat(const struct ggml_tensor *src0,
   if ((src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 ||
        ggml_is_quantized(src0->type)) &&
       src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-      ((ne0 >= 32 && ne1 >= 32 && ne10 >= 32) ||
-       src0->backend == GGML_BACKEND_GPU)) {
+      ((ne0 >= 32 && ne1 >= 32 && ne10 >= 32))) {
     return true;
   }
 
@@ -1772,11 +1739,6 @@ bool ggml_sycl_can_mul_mat(const struct ggml_tensor *src0,
 static bool ggml_sycl_mul_mat_use_f16(const struct ggml_tensor *src0,
                                       const struct ggml_tensor *src1,
                                       struct ggml_tensor * /* dst */) {
-  // If device doesn't support FP16
-  if (!fp16_support) {
-    return false;
-  }
-
   size_t src0_sz = ggml_nbytes(src0);
   size_t src1_sz = ggml_nbytes(src1);
 
