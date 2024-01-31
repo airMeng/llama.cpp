@@ -2858,8 +2858,8 @@ static int g_work_group_size = 0;
 // typedef sycl::half ggml_fp16_t;
 
 #define __SYCL_ARCH__ DPCT_COMPATIBILITY_TEMP
-#define VER_4VEC   610          //todo for hardward optimize.
-#define VER_GEN9      700       //todo for hardward optimize.
+#define VER_4VEC   130          //todo for hardward optimize.
+#define VER_GEN9   110          //todo for hardward optimize.
 #define VER_GEN12 1000000       //todo for hardward optimize.
 #define VER_GEN13      (VER_GEN12 + 1030)   //todo for hardward optimize.
 
@@ -3145,6 +3145,27 @@ typedef struct dpct_type_107281 {
     sycl::half d;            // delta
 } block_q6_K;
 static_assert(sizeof(block_q6_K) == sizeof(ggml_fp16_t) + 13*QK_K/16, "wrong q6_K block size/padding");
+
+#define QR2_XXS 8
+#define QI2_XXS (QK_K / (4 * QR2_XXS))
+typedef struct {
+  sycl::half d;
+  uint16_t qs[QK_K / 8];
+} block_iq2_xxs;
+static_assert(sizeof(block_iq2_xxs) ==
+                  sizeof(ggml_fp16_t) + QK_K / 8 * sizeof(uint16_t),
+              "wrong iq2_xxs block size/padding");
+
+#define QR2_XS 8
+#define QI2_XS (QK_K / (4 * QR2_XS))
+typedef struct {
+  sycl::half d;
+  uint16_t qs[QK_K / 8];
+  uint8_t scales[QK_K / 32];
+} block_iq2_xs;
+static_assert(sizeof(block_iq2_xs) ==
+                  sizeof(ggml_fp16_t) + QK_K / 8 * sizeof(uint16_t) + QK_K / 32,
+              "wrong iq2_xs block size/padding");
 
 #define WARP_SIZE 32
 #define MATRIX_ROW_PADDING 512 // last row of quant. matrices is a multiple of this to avoid out-of-bounds memory accesses
@@ -4151,6 +4172,334 @@ static void dequantize_block_q6_K(const void * __restrict__ vx, dst_t * __restri
 
     y[ 0] = d * sc[ip+0] * ((int8_t)((ql & 0xF) | (((qh >> 0) & 3) << 4)) - 32);
     y[32] = d * sc[ip+2] * ((int8_t)((ql  >> 4) | (((qh >> 4) & 3) << 4)) - 32);
+#endif
+}
+
+static const uint64_t iq2xxs_grid[256] = {
+    0x0808080808080808, 0x080808080808082b, 0x0808080808081919,
+    0x0808080808082b08, 0x0808080808082b2b, 0x0808080808190819,
+    0x0808080808191908, 0x08080808082b0808, 0x08080808082b082b,
+    0x08080808082b2b08, 0x08080808082b2b2b, 0x0808080819080819,
+    0x0808080819081908, 0x0808080819190808, 0x0808080819192b08,
+    0x08080808192b0819, 0x08080808192b1908, 0x080808082b080808,
+    0x080808082b08082b, 0x080808082b082b2b, 0x080808082b2b082b,
+    0x0808081908080819, 0x0808081908081908, 0x0808081908190808,
+    0x0808081908191919, 0x0808081919080808, 0x080808192b081908,
+    0x080808192b192b08, 0x0808082b08080808, 0x0808082b0808082b,
+    0x0808082b082b082b, 0x0808082b2b08082b, 0x0808190808080819,
+    0x0808190808081908, 0x0808190808190808, 0x08081908082b0819,
+    0x08081908082b1908, 0x0808190819080808, 0x080819081908082b,
+    0x0808190819082b08, 0x08081908192b0808, 0x080819082b080819,
+    0x080819082b081908, 0x080819082b190808, 0x080819082b2b1908,
+    0x0808191908080808, 0x080819190808082b, 0x0808191908082b08,
+    0x08081919082b0808, 0x080819191908192b, 0x08081919192b2b19,
+    0x080819192b080808, 0x080819192b190819, 0x0808192b08082b19,
+    0x0808192b08190808, 0x0808192b19080808, 0x0808192b2b081908,
+    0x0808192b2b2b1908, 0x08082b0808080808, 0x08082b0808081919,
+    0x08082b0808082b08, 0x08082b0808191908, 0x08082b08082b2b08,
+    0x08082b0819080819, 0x08082b0819081908, 0x08082b0819190808,
+    0x08082b081919082b, 0x08082b082b082b08, 0x08082b1908081908,
+    0x08082b1919080808, 0x08082b2b0808082b, 0x08082b2b08191908,
+    0x0819080808080819, 0x0819080808081908, 0x0819080808190808,
+    0x08190808082b0819, 0x0819080819080808, 0x08190808192b0808,
+    0x081908082b081908, 0x081908082b190808, 0x081908082b191919,
+    0x0819081908080808, 0x0819081908082b08, 0x08190819082b0808,
+    0x0819081919190808, 0x0819081919192b2b, 0x081908192b080808,
+    0x0819082b082b1908, 0x0819082b19081919, 0x0819190808080808,
+    0x0819190808082b08, 0x08191908082b0808, 0x08191908082b1919,
+    0x0819190819082b19, 0x081919082b080808, 0x0819191908192b08,
+    0x08191919192b082b, 0x0819192b08080808, 0x0819192b0819192b,
+    0x08192b0808080819, 0x08192b0808081908, 0x08192b0808190808,
+    0x08192b0819080808, 0x08192b082b080819, 0x08192b1908080808,
+    0x08192b1908081919, 0x08192b192b2b0808, 0x08192b2b19190819,
+    0x082b080808080808, 0x082b08080808082b, 0x082b080808082b2b,
+    0x082b080819081908, 0x082b0808192b0819, 0x082b08082b080808,
+    0x082b08082b08082b, 0x082b0819082b2b19, 0x082b081919082b08,
+    0x082b082b08080808, 0x082b082b0808082b, 0x082b190808080819,
+    0x082b190808081908, 0x082b190808190808, 0x082b190819080808,
+    0x082b19081919192b, 0x082b191908080808, 0x082b191919080819,
+    0x082b1919192b1908, 0x082b192b2b190808, 0x082b2b0808082b08,
+    0x082b2b08082b0808, 0x082b2b082b191908, 0x082b2b2b19081908,
+    0x1908080808080819, 0x1908080808081908, 0x1908080808190808,
+    0x1908080808192b08, 0x19080808082b0819, 0x19080808082b1908,
+    0x1908080819080808, 0x1908080819082b08, 0x190808081919192b,
+    0x19080808192b0808, 0x190808082b080819, 0x190808082b081908,
+    0x190808082b190808, 0x1908081908080808, 0x19080819082b0808,
+    0x19080819192b0819, 0x190808192b080808, 0x190808192b081919,
+    0x1908082b08080819, 0x1908082b08190808, 0x1908082b19082b08,
+    0x1908082b1919192b, 0x1908082b192b2b08, 0x1908190808080808,
+    0x1908190808082b08, 0x19081908082b0808, 0x190819082b080808,
+    0x190819082b192b19, 0x190819190819082b, 0x19081919082b1908,
+    0x1908192b08080808, 0x19082b0808080819, 0x19082b0808081908,
+    0x19082b0808190808, 0x19082b0819080808, 0x19082b0819081919,
+    0x19082b1908080808, 0x19082b1919192b08, 0x19082b19192b0819,
+    0x19082b192b08082b, 0x19082b2b19081919, 0x19082b2b2b190808,
+    0x1919080808080808, 0x1919080808082b08, 0x1919080808190819,
+    0x1919080808192b19, 0x19190808082b0808, 0x191908082b080808,
+    0x191908082b082b08, 0x1919081908081908, 0x191908191908082b,
+    0x191908192b2b1908, 0x1919082b2b190819, 0x191919082b190808,
+    0x191919082b19082b, 0x1919191908082b2b, 0x1919192b08080819,
+    0x1919192b19191908, 0x19192b0808080808, 0x19192b0808190819,
+    0x19192b0808192b19, 0x19192b08192b1908, 0x19192b1919080808,
+    0x19192b2b08082b08, 0x192b080808081908, 0x192b080808190808,
+    0x192b080819080808, 0x192b0808192b2b08, 0x192b081908080808,
+    0x192b081919191919, 0x192b082b08192b08, 0x192b082b192b0808,
+    0x192b190808080808, 0x192b190808081919, 0x192b191908190808,
+    0x192b19190819082b, 0x192b19192b081908, 0x192b2b081908082b,
+    0x2b08080808080808, 0x2b0808080808082b, 0x2b08080808082b2b,
+    0x2b08080819080819, 0x2b0808082b08082b, 0x2b08081908081908,
+    0x2b08081908192b08, 0x2b08081919080808, 0x2b08082b08190819,
+    0x2b08190808080819, 0x2b08190808081908, 0x2b08190808190808,
+    0x2b08190808191919, 0x2b08190819080808, 0x2b081908192b0808,
+    0x2b08191908080808, 0x2b0819191908192b, 0x2b0819192b191908,
+    0x2b08192b08082b19, 0x2b08192b19080808, 0x2b08192b192b0808,
+    0x2b082b080808082b, 0x2b082b1908081908, 0x2b082b2b08190819,
+    0x2b19080808081908, 0x2b19080808190808, 0x2b190808082b1908,
+    0x2b19080819080808, 0x2b1908082b2b0819, 0x2b1908190819192b,
+    0x2b1908192b080808, 0x2b19082b19081919, 0x2b19190808080808,
+    0x2b191908082b082b, 0x2b19190819081908, 0x2b19191919190819,
+    0x2b192b082b080819, 0x2b192b19082b0808, 0x2b2b08080808082b,
+    0x2b2b080819190808, 0x2b2b08082b081919, 0x2b2b081908082b19,
+    0x2b2b082b08080808, 0x2b2b190808192b08, 0x2b2b2b0819190808,
+    0x2b2b2b1908081908,
+};
+
+static const uint64_t iq2xs_grid[512] = {
+    0x0808080808080808, 0x080808080808082b, 0x0808080808081919,
+    0x0808080808082b08, 0x0808080808082b2b, 0x0808080808190819,
+    0x0808080808191908, 0x080808080819192b, 0x0808080808192b19,
+    0x08080808082b0808, 0x08080808082b082b, 0x08080808082b1919,
+    0x08080808082b2b08, 0x0808080819080819, 0x0808080819081908,
+    0x080808081908192b, 0x0808080819082b19, 0x0808080819190808,
+    0x080808081919082b, 0x0808080819191919, 0x0808080819192b08,
+    0x08080808192b0819, 0x08080808192b1908, 0x080808082b080808,
+    0x080808082b08082b, 0x080808082b081919, 0x080808082b082b08,
+    0x080808082b190819, 0x080808082b191908, 0x080808082b192b19,
+    0x080808082b2b0808, 0x0808081908080819, 0x0808081908081908,
+    0x080808190808192b, 0x0808081908082b19, 0x0808081908190808,
+    0x080808190819082b, 0x0808081908191919, 0x0808081908192b08,
+    0x0808081908192b2b, 0x08080819082b0819, 0x08080819082b1908,
+    0x0808081919080808, 0x080808191908082b, 0x0808081919081919,
+    0x0808081919082b08, 0x0808081919190819, 0x0808081919191908,
+    0x08080819192b0808, 0x08080819192b2b08, 0x080808192b080819,
+    0x080808192b081908, 0x080808192b190808, 0x0808082b08080808,
+    0x0808082b0808082b, 0x0808082b08081919, 0x0808082b08082b08,
+    0x0808082b08190819, 0x0808082b08191908, 0x0808082b082b0808,
+    0x0808082b19080819, 0x0808082b19081908, 0x0808082b19190808,
+    0x0808082b19191919, 0x0808082b2b080808, 0x0808082b2b082b2b,
+    0x0808190808080819, 0x0808190808081908, 0x080819080808192b,
+    0x0808190808082b19, 0x0808190808190808, 0x080819080819082b,
+    0x0808190808191919, 0x0808190808192b08, 0x08081908082b0819,
+    0x08081908082b1908, 0x0808190819080808, 0x080819081908082b,
+    0x0808190819081919, 0x0808190819082b08, 0x0808190819190819,
+    0x0808190819191908, 0x080819081919192b, 0x08081908192b0808,
+    0x080819082b080819, 0x080819082b081908, 0x080819082b190808,
+    0x0808191908080808, 0x080819190808082b, 0x0808191908081919,
+    0x0808191908082b08, 0x0808191908190819, 0x0808191908191908,
+    0x08081919082b0808, 0x0808191919080819, 0x0808191919081908,
+    0x0808191919190808, 0x08081919192b0819, 0x080819192b080808,
+    0x0808192b08080819, 0x0808192b08081908, 0x0808192b08190808,
+    0x0808192b082b192b, 0x0808192b19080808, 0x0808192b1908082b,
+    0x0808192b2b081908, 0x08082b0808080808, 0x08082b080808082b,
+    0x08082b0808081919, 0x08082b0808082b08, 0x08082b0808082b2b,
+    0x08082b0808190819, 0x08082b0808191908, 0x08082b08082b0808,
+    0x08082b08082b1919, 0x08082b0819080819, 0x08082b0819081908,
+    0x08082b0819190808, 0x08082b0819192b08, 0x08082b082b080808,
+    0x08082b082b2b0808, 0x08082b082b2b2b2b, 0x08082b1908080819,
+    0x08082b1908081908, 0x08082b1908190808, 0x08082b1919080808,
+    0x08082b192b080819, 0x08082b192b082b19, 0x08082b2b08080808,
+    0x08082b2b082b0808, 0x08082b2b082b2b08, 0x08082b2b2b19192b,
+    0x08082b2b2b2b0808, 0x0819080808080819, 0x0819080808081908,
+    0x081908080808192b, 0x0819080808082b19, 0x0819080808190808,
+    0x081908080819082b, 0x0819080808191919, 0x0819080808192b08,
+    0x08190808082b0819, 0x08190808082b1908, 0x0819080819080808,
+    0x081908081908082b, 0x0819080819081919, 0x0819080819082b08,
+    0x0819080819190819, 0x0819080819191908, 0x08190808192b0808,
+    0x08190808192b2b2b, 0x081908082b080819, 0x081908082b081908,
+    0x081908082b190808, 0x0819081908080808, 0x081908190808082b,
+    0x0819081908081919, 0x0819081908082b08, 0x0819081908190819,
+    0x0819081908191908, 0x08190819082b0808, 0x0819081919080819,
+    0x0819081919081908, 0x0819081919190808, 0x081908192b080808,
+    0x081908192b191908, 0x081908192b19192b, 0x0819082b08080819,
+    0x0819082b08081908, 0x0819082b0808192b, 0x0819082b08190808,
+    0x0819082b19080808, 0x0819082b192b0808, 0x0819190808080808,
+    0x081919080808082b, 0x0819190808081919, 0x0819190808082b08,
+    0x0819190808190819, 0x0819190808191908, 0x08191908082b0808,
+    0x0819190819080819, 0x0819190819081908, 0x0819190819082b19,
+    0x0819190819190808, 0x08191908192b1908, 0x081919082b080808,
+    0x0819191908080819, 0x0819191908081908, 0x0819191908190808,
+    0x0819191919080808, 0x0819192b08080808, 0x0819192b08191908,
+    0x0819192b19082b19, 0x08192b0808080819, 0x08192b0808081908,
+    0x08192b0808190808, 0x08192b080819082b, 0x08192b0819080808,
+    0x08192b0819191908, 0x08192b082b08192b, 0x08192b1908080808,
+    0x08192b1908081919, 0x08192b19192b192b, 0x08192b2b19190819,
+    0x08192b2b2b2b2b19, 0x082b080808080808, 0x082b08080808082b,
+    0x082b080808081919, 0x082b080808082b08, 0x082b080808082b2b,
+    0x082b080808190819, 0x082b080808191908, 0x082b0808082b0808,
+    0x082b080819080819, 0x082b080819081908, 0x082b080819190808,
+    0x082b08082b080808, 0x082b08082b2b0808, 0x082b081908080819,
+    0x082b081908081908, 0x082b081908190808, 0x082b081919080808,
+    0x082b081919082b08, 0x082b0819192b1919, 0x082b082b08080808,
+    0x082b082b082b082b, 0x082b082b2b080808, 0x082b082b2b2b2b08,
+    0x082b190808080819, 0x082b190808081908, 0x082b190808190808,
+    0x082b1908082b2b19, 0x082b190819080808, 0x082b191908080808,
+    0x082b191919080819, 0x082b19191919082b, 0x082b19192b192b19,
+    0x082b192b08080819, 0x082b192b08192b2b, 0x082b192b2b2b192b,
+    0x082b2b0808080808, 0x082b2b0808082b08, 0x082b2b0808082b2b,
+    0x082b2b08082b0808, 0x082b2b0819191919, 0x082b2b082b082b08,
+    0x082b2b082b2b082b, 0x082b2b19192b2b08, 0x082b2b192b190808,
+    0x082b2b2b08082b08, 0x082b2b2b082b0808, 0x082b2b2b2b08082b,
+    0x082b2b2b2b082b08, 0x082b2b2b2b082b2b, 0x1908080808080819,
+    0x1908080808081908, 0x190808080808192b, 0x1908080808082b19,
+    0x1908080808190808, 0x190808080819082b, 0x1908080808191919,
+    0x1908080808192b08, 0x19080808082b0819, 0x19080808082b1908,
+    0x1908080819080808, 0x190808081908082b, 0x1908080819081919,
+    0x1908080819082b08, 0x1908080819082b2b, 0x1908080819190819,
+    0x1908080819191908, 0x19080808192b0808, 0x19080808192b1919,
+    0x190808082b080819, 0x190808082b081908, 0x190808082b190808,
+    0x1908081908080808, 0x190808190808082b, 0x1908081908081919,
+    0x1908081908082b08, 0x1908081908190819, 0x1908081908191908,
+    0x19080819082b0808, 0x1908081919080819, 0x1908081919081908,
+    0x1908081919190808, 0x190808192b080808, 0x190808192b081919,
+    0x190808192b2b082b, 0x1908082b08080819, 0x1908082b08081908,
+    0x1908082b08190808, 0x1908082b0819082b, 0x1908082b082b2b19,
+    0x1908082b19080808, 0x1908190808080808, 0x190819080808082b,
+    0x1908190808081919, 0x1908190808082b08, 0x1908190808190819,
+    0x1908190808191908, 0x1908190808192b19, 0x19081908082b0808,
+    0x1908190819080819, 0x1908190819081908, 0x1908190819190808,
+    0x190819082b080808, 0x190819082b191908, 0x1908191908080819,
+    0x1908191908081908, 0x1908191908190808, 0x19081919082b1908,
+    0x1908191919080808, 0x190819192b192b2b, 0x1908192b08080808,
+    0x1908192b08082b2b, 0x1908192b19081908, 0x1908192b19190808,
+    0x19082b0808080819, 0x19082b0808081908, 0x19082b0808190808,
+    0x19082b0819080808, 0x19082b0819081919, 0x19082b0819191908,
+    0x19082b08192b082b, 0x19082b1908080808, 0x19082b1908190819,
+    0x19082b1919081908, 0x19082b1919190808, 0x19082b19192b2b19,
+    0x19082b2b08081908, 0x1919080808080808, 0x191908080808082b,
+    0x1919080808081919, 0x1919080808082b08, 0x1919080808190819,
+    0x1919080808191908, 0x19190808082b0808, 0x19190808082b2b08,
+    0x1919080819080819, 0x1919080819081908, 0x1919080819190808,
+    0x191908082b080808, 0x1919081908080819, 0x1919081908081908,
+    0x1919081908190808, 0x1919081908191919, 0x1919081919080808,
+    0x191908191908082b, 0x1919082b08080808, 0x1919082b19081908,
+    0x1919082b2b2b2b2b, 0x1919190808080819, 0x1919190808081908,
+    0x1919190808190808, 0x19191908082b0819, 0x1919190819080808,
+    0x19191908192b0808, 0x191919082b080819, 0x191919082b2b0819,
+    0x1919191908080808, 0x1919191908082b08, 0x191919192b080808,
+    0x191919192b082b08, 0x1919192b082b0819, 0x1919192b192b2b08,
+    0x1919192b2b2b0819, 0x19192b0808080808, 0x19192b0808191908,
+    0x19192b0819080819, 0x19192b0819190808, 0x19192b082b192b19,
+    0x19192b1908192b2b, 0x19192b1919080808, 0x19192b191908082b,
+    0x19192b2b2b081919, 0x192b080808080819, 0x192b080808081908,
+    0x192b080808190808, 0x192b080819080808, 0x192b080819191908,
+    0x192b0808192b082b, 0x192b08082b08192b, 0x192b08082b2b2b19,
+    0x192b081908080808, 0x192b082b082b1908, 0x192b082b19082b2b,
+    0x192b082b2b19082b, 0x192b190808080808, 0x192b19080819192b,
+    0x192b191908190808, 0x192b191919080808, 0x192b191919081919,
+    0x192b19192b2b1908, 0x192b2b0808080819, 0x192b2b08192b2b2b,
+    0x192b2b19082b1919, 0x192b2b2b0808192b, 0x192b2b2b19191908,
+    0x192b2b2b192b082b, 0x2b08080808080808, 0x2b0808080808082b,
+    0x2b08080808081919, 0x2b08080808082b08, 0x2b08080808190819,
+    0x2b08080808191908, 0x2b080808082b0808, 0x2b080808082b2b2b,
+    0x2b08080819080819, 0x2b08080819081908, 0x2b08080819190808,
+    0x2b0808082b080808, 0x2b0808082b08082b, 0x2b0808082b2b2b08,
+    0x2b0808082b2b2b2b, 0x2b08081908080819, 0x2b08081908081908,
+    0x2b0808190808192b, 0x2b08081908190808, 0x2b08081919080808,
+    0x2b08081919190819, 0x2b08081919192b19, 0x2b08082b08080808,
+    0x2b08082b082b0808, 0x2b08082b2b080808, 0x2b08082b2b08082b,
+    0x2b08082b2b2b0808, 0x2b08082b2b2b2b08, 0x2b08190808080819,
+    0x2b08190808081908, 0x2b08190808190808, 0x2b0819080819082b,
+    0x2b08190808191919, 0x2b08190819080808, 0x2b081908192b0808,
+    0x2b0819082b082b19, 0x2b08191908080808, 0x2b08191919081908,
+    0x2b0819192b2b1919, 0x2b08192b08192b08, 0x2b08192b192b2b2b,
+    0x2b082b0808080808, 0x2b082b0808082b08, 0x2b082b08082b1919,
+    0x2b082b0819192b2b, 0x2b082b082b080808, 0x2b082b082b08082b,
+    0x2b082b082b2b2b08, 0x2b082b190808192b, 0x2b082b2b082b082b,
+    0x2b082b2b2b080808, 0x2b082b2b2b082b08, 0x2b082b2b2b19192b,
+    0x2b082b2b2b2b2b08, 0x2b19080808080819, 0x2b19080808081908,
+    0x2b19080808190808, 0x2b19080819080808, 0x2b1908081919192b,
+    0x2b1908082b081908, 0x2b19081908080808, 0x2b190819082b082b,
+    0x2b190819192b1908, 0x2b19082b1919192b, 0x2b19082b2b082b19,
+    0x2b19190808080808, 0x2b19190808081919, 0x2b19190819081908,
+    0x2b19190819190808, 0x2b19190819192b08, 0x2b191919082b2b19,
+    0x2b1919192b190808, 0x2b1919192b19082b, 0x2b19192b19080819,
+    0x2b192b0819190819, 0x2b192b082b2b192b, 0x2b192b1919082b19,
+    0x2b192b2b08191919, 0x2b192b2b192b0808, 0x2b2b080808080808,
+    0x2b2b08080808082b, 0x2b2b080808082b08, 0x2b2b080808082b2b,
+    0x2b2b0808082b0808, 0x2b2b0808082b2b2b, 0x2b2b08082b2b0808,
+    0x2b2b081919190819, 0x2b2b081919192b19, 0x2b2b08192b2b192b,
+    0x2b2b082b08080808, 0x2b2b082b0808082b, 0x2b2b082b08082b08,
+    0x2b2b082b082b2b2b, 0x2b2b082b2b080808, 0x2b2b082b2b2b0808,
+    0x2b2b190819080808, 0x2b2b19082b191919, 0x2b2b192b192b1919,
+    0x2b2b192b2b192b08, 0x2b2b2b0808082b2b, 0x2b2b2b08082b0808,
+    0x2b2b2b08082b082b, 0x2b2b2b08082b2b08, 0x2b2b2b082b2b0808,
+    0x2b2b2b082b2b2b08, 0x2b2b2b1908081908, 0x2b2b2b192b081908,
+    0x2b2b2b192b08192b, 0x2b2b2b2b082b2b08, 0x2b2b2b2b082b2b2b,
+    0x2b2b2b2b2b190819, 0x2b2b2b2b2b2b2b2b,
+};
+
+static const uint8_t ksigns_iq2xs[128] = {
+    0,   129, 130, 3,   132, 5,   6,   135, 136, 9,   10,  139, 12,  141, 142,
+    15,  144, 17,  18,  147, 20,  149, 150, 23,  24,  153, 154, 27,  156, 29,
+    30,  159, 160, 33,  34,  163, 36,  165, 166, 39,  40,  169, 170, 43,  172,
+    45,  46,  175, 48,  177, 178, 51,  180, 53,  54,  183, 184, 57,  58,  187,
+    60,  189, 190, 63,  192, 65,  66,  195, 68,  197, 198, 71,  72,  201, 202,
+    75,  204, 77,  78,  207, 80,  209, 210, 83,  212, 85,  86,  215, 216, 89,
+    90,  219, 92,  221, 222, 95,  96,  225, 226, 99,  228, 101, 102, 231, 232,
+    105, 106, 235, 108, 237, 238, 111, 240, 113, 114, 243, 116, 245, 246, 119,
+    120, 249, 250, 123, 252, 125, 126, 255,
+};
+
+static const uint8_t kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+
+template <typename dst_t>
+static void dequantize_block_iq2_xxs(const void *__restrict__ vx,
+                                     dst_t *__restrict__ yy,
+                                     const sycl::nd_item<3> &item_ct1) {
+  const block_iq2_xxs *x = (const block_iq2_xxs *)vx;
+
+  const int i = item_ct1.get_group(2);
+#if QK_K == 256
+
+  // assume 64 threads - this is very slightly better than the one below
+  const int tid = item_ct1.get_local_id(2);
+  const int il = tid / 8;  // 0...3
+  const int ib = tid % 8;  // 0...7
+  dst_t *y = yy + i * QK_K + 32 * ib + 8 * il;
+  const uint16_t *q2 = x[i].qs + 4 * ib;
+  const uint8_t *aux8 = (const uint8_t *)q2;
+  const uint8_t *grid = (const uint8_t *)(iq2xxs_grid + aux8[il]);
+  const uint32_t aux32 = q2[2] | (q2[3] << 16);
+  const float d = (float)x[i].d * (0.5f + (aux32 >> 28)) * 0.25f;
+  const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
+  for (int j = 0; j < 8; ++j)
+    y[j] = d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+#else
+  assert(false);
+#endif
+}
+
+template <typename dst_t>
+static void dequantize_block_iq2_xs(const void *__restrict__ vx,
+                                    dst_t *__restrict__ yy,
+                                    const sycl::nd_item<3> &item_ct1) {
+  const int i = item_ct1.get_group(2);
+  const block_iq2_xs *x = (const block_iq2_xs *)vx;
+
+  const int tid = item_ct1.get_local_id(2);
+#if QK_K == 256
+  const int il = tid / 8;  // 0...3
+  const int ib = tid % 8;  // 0...7
+  dst_t *y = yy + i * QK_K + 32 * ib + 8 * il;
+  const uint16_t *q2 = x[i].qs + 4 * ib;
+  const uint8_t *grid = (const uint8_t *)(iq2xs_grid + (q2[il] & 511));
+  const float d = (float)x[i].d *
+                  (0.5f + ((x[i].scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
+  const uint8_t signs = ksigns_iq2xs[q2[il] >> 9];
+  for (int j = 0; j < 8; ++j)
+    y[j] = d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+#else
+  assert(false);
 #endif
 }
 
@@ -6837,6 +7186,95 @@ static __dpct_inline__ float vec_dot_q6_K_q8_1_mul_mat(
     return vec_dot_q6_K_q8_1_impl_mmq(&x_ql[index_x], &y_qs[index_y], sc, x_dmf[i * (WARP_SIZE/QI6_K) + i/QI6_K], &y_df[index_y/QI8_1]);
 }
 
+static __dpct_inline__ float vec_dot_iq2_xxs_q8_1(
+    const void *__restrict__ vbq, const block_q8_1 *__restrict__ bq8_1,
+    const int &iqs) {
+#if QK_K == 256
+  const block_iq2_xxs *bq2 = (const block_iq2_xxs *)vbq;
+
+#if QR2_XXS == 8
+  const int ib32 = iqs;
+  const uint16_t *q2 = bq2->qs + 4 * ib32;
+  const uint8_t *aux8 = (const uint8_t *)q2;
+  const int8_t *q8 = bq8_1[ib32].qs;
+  uint32_t aux32 = q2[2] | (q2[3] << 16);
+  int sumi = 0;
+  for (int l = 0; l < 4; ++l) {
+    const uint8_t *grid = (const uint8_t *)(iq2xxs_grid + aux8[l]);
+    const uint8_t signs = ksigns_iq2xs[aux32 & 127];
+    for (int j = 0; j < 8; ++j) {
+      sumi += q8[j] * grid[j] * (signs & kmask_iq2xs[j] ? -1 : 1);
+    }
+    q8 += 8;
+    aux32 >>= 7;
+  }
+  const float d =
+      (float)bq2->d * (0.5f + aux32) * ((float)(bq8_1[ib32].ds[0])) * 0.25f;
+  return d * sumi;
+#else
+  // iqs is 0...15
+  const int ib32 = iqs / 2;
+  const int il = iqs % 2;
+  const uint16_t *q2 = bq2->qs + 4 * ib32;
+  const uint8_t *aux8 = (const uint8_t *)q2;
+  const uint8_t *grid1 = (const uint8_t *)(iq2xxs_grid + aux8[2 * il + 0]);
+  const uint8_t *grid2 = (const uint8_t *)(iq2xxs_grid + aux8[2 * il + 1]);
+  const uint32_t aux32 = q2[2] | (q2[3] << 16);
+  const float d = (float)bq2->d * (0.5f + (aux32 >> 28)) *
+                  ((float)bq8_1[ib32].ds[0]) * 0.25f;
+  const uint8_t signs1 = ksigns_iq2xs[(aux32 >> 14 * il) & 127];
+  const uint8_t signs2 = ksigns_iq2xs[(aux32 >> (14 * il + 7)) & 127];
+  const int8_t *q8 = bq8_1[ib32].qs + 16 * il;
+  int sumi1 = 0, sumi2 = 0;
+  for (int j = 0; j < 8; ++j) {
+    sumi1 += q8[j + 0] * grid1[j] * (signs1 & kmask_iq2xs[j] ? -1 : 1);
+    sumi2 += q8[j + 8] * grid2[j] * (signs2 & kmask_iq2xs[j] ? -1 : 1);
+  }
+  return d * (sumi1 + sumi2);
+#endif
+#else
+  assert(false);
+  return 0.f;
+#endif
+}
+
+static __dpct_inline__ float vec_dot_iq2_xs_q8_1(
+    const void *__restrict__ vbq, const block_q8_1 *__restrict__ bq8_1,
+    const int &iqs) {
+#if QK_K == 256
+  const block_iq2_xs *bq2 = (const block_iq2_xs *)vbq;
+
+  const int ib32 = iqs;
+  const uint16_t *q2 = bq2->qs + 4 * ib32;
+  const int8_t *q8 = bq8_1[ib32].qs;
+  const uint8_t ls1 = bq2->scales[ib32] & 0xf;
+  const uint8_t ls2 = bq2->scales[ib32] >> 4;
+  int sumi1 = 0;
+  for (int l = 0; l < 2; ++l) {
+    const uint8_t *grid = (const uint8_t *)(iq2xs_grid + (q2[l] & 511));
+    const uint8_t signs = ksigns_iq2xs[q2[l] >> 9];
+    for (int j = 0; j < 8; ++j) {
+      sumi1 += q8[j] * grid[j] * (signs & kmask_iq2xs[j] ? -1 : 1);
+    }
+    q8 += 8;
+  }
+  int sumi2 = 0;
+  for (int l = 2; l < 4; ++l) {
+    const uint8_t *grid = (const uint8_t *)(iq2xs_grid + (q2[l] & 511));
+    const uint8_t signs = ksigns_iq2xs[q2[l] >> 9];
+    for (int j = 0; j < 8; ++j) {
+      sumi2 += q8[j] * grid[j] * (signs & kmask_iq2xs[j] ? -1 : 1);
+    }
+    q8 += 8;
+  }
+  const float d = (float)bq2->d * ((float)bq8_1[ib32].ds[0]) * 0.25f;
+  return d * ((0.5f + ls1) * sumi1 + (0.5f + ls2) * sumi2);
+#else
+  assert(false);
+  return 0.f;
+#endif
+}
+
 template <int qk, int qr, int qi, bool need_sum, typename block_q_t, int mmq_x,
           int mmq_y, int nwarps, load_tiles_sycl_t load_tiles, int vdr,
           vec_dot_q_mul_mat_sycl_t vec_dot>
@@ -8802,7 +9240,7 @@ static void dequantize_row_q2_K_sycl(const void *vx, dst_t *y, const int k,
                              });
     }
 #else
-    dequantize_block_q2_K<<<nb, 32, 0, stream>>>(vx, y);
+    GGML_ASSERT(false);
 #endif
 }
 
@@ -8823,7 +9261,7 @@ static void dequantize_row_q3_K_sycl(const void *vx, dst_t *y, const int k,
                              });
     }
 #else
-    dequantize_block_q3_K<<<nb, 32, 0, stream>>>(vx, y);
+    GGML_ASSERT(false);
 #endif
 }
 
@@ -8861,7 +9299,7 @@ static void dequantize_row_q5_K_sycl(const void *vx, dst_t *y, const int k,
                              });
     }
 #else
-    dequantize_block_q5_K<<<nb, 32, 0, stream>>>(vx, y);
+    GML_ASSERT(false);
 #endif
 }
 
@@ -8882,7 +9320,43 @@ static void dequantize_row_q6_K_sycl(const void *vx, dst_t *y, const int k,
                              });
     }
 #else
-    dequantize_block_q6_K<<<nb, 32, 0, stream>>>(vx, y);
+    GGML_ASSERT(false);
+#endif
+}
+
+template <typename dst_t>
+static void dequantize_row_iq2_xxs_sycl(const void *vx, dst_t *y, const int k,
+                                        dpct::queue_ptr stream) {
+  const int nb = k / QK_K;
+#if QK_K == 256
+  {
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, 32),
+                          sycl::range<3>(1, 1, 32)),
+        [=](sycl::nd_item<3> item_ct1) {
+          dequantize_block_iq2_xxs(vx, y, item_ct1);
+        });
+  }
+#else
+    GGML_ASSERT(false);
+#endif
+}
+
+template <typename dst_t>
+static void dequantize_row_iq2_xs_sycl(const void *vx, dst_t *y, const int k,
+                                       dpct::queue_ptr stream) {
+  const int nb = k / QK_K;
+#if QK_K == 256
+  {
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, 32),
+                          sycl::range<3>(1, 1, 32)),
+        [=](sycl::nd_item<3> item_ct1) {
+          dequantize_block_iq2_xs(vx, y, item_ct1);
+        });
+  }
+#else
+    GGML_ASSERT(false);
 #endif
 }
 
@@ -8910,6 +9384,10 @@ static to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type) {
             return dequantize_row_q6_K_sycl;
         case GGML_TYPE_F32:
             return dequantize_block_sycl<1, 1, convert_f32>;
+        case GGML_TYPE_IQ2_XXS:
+          return dequantize_row_iq2_xxs_sycl;
+        case GGML_TYPE_IQ2_XS:
+          return dequantize_row_iq2_xs_sycl;
         default:
             return nullptr;
     }
@@ -8939,6 +9417,10 @@ static to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type) {
             return dequantize_row_q6_K_sycl;
         case GGML_TYPE_F16:
             return dequantize_block_sycl<1, 1, convert_f16>;
+        case GGML_TYPE_IQ2_XXS:
+          return dequantize_row_iq2_xxs_sycl;
+        case GGML_TYPE_IQ2_XS:
+          return dequantize_row_iq2_xs_sycl;
         default:
             return nullptr;
     }
@@ -9316,6 +9798,38 @@ static void mul_mat_vec_q6_K_q8_1_sycl(const void *vx, const void *vy,
                           vec_dot_q6_K_q8_1>(vx, vy, dst, ncols, nrows,
                                              item_ct1);
         });
+}
+
+static void mul_mat_vec_iq2_xxs_q8_1_sycl(const void *vx, const void *vy,
+                                          float *dst, const int ncols,
+                                          const int nrows,
+                                          dpct::queue_ptr stream) {
+  GGML_ASSERT(ncols % QK_K == 0);
+  const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+  const sycl::range<3> block_nums(1, 1, block_num_y);
+  const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+  stream->parallel_for(
+      sycl::nd_range<3>(block_nums * block_dims, block_dims),
+      [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(32)]] {
+        mul_mat_vec_q<QK_K, QI2_XXS, block_iq2_xxs, 1, vec_dot_iq2_xxs_q8_1>(
+            vx, vy, dst, ncols, nrows, item_ct1);
+      });
+}
+
+static void mul_mat_vec_iq2_xs_q8_1_sycl(const void *vx, const void *vy,
+                                         float *dst, const int ncols,
+                                         const int nrows,
+                                         dpct::queue_ptr stream) {
+  GGML_ASSERT(ncols % QK_K == 0);
+  const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+  const sycl::range<3> block_nums(1, 1, block_num_y);
+  const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+  stream->parallel_for(
+      sycl::nd_range<3>(block_nums * block_dims, block_dims),
+      [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(32)]] {
+        mul_mat_vec_q<QK_K, QI2_XS, block_iq2_xs, 1, vec_dot_iq2_xs_q8_1>(
+            vx, vy, dst, ncols, nrows, item_ct1);
+      });
 }
 
 int get_device_index_by_id(int id){
@@ -12076,6 +12590,14 @@ inline void ggml_sycl_op_mul_mat_vec_q(
         case GGML_TYPE_Q6_K:
             mul_mat_vec_q6_K_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
             break;
+        case GGML_TYPE_IQ2_XXS:
+          mul_mat_vec_iq2_xxs_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00,
+                                        row_diff, stream);
+          break;
+        case GGML_TYPE_IQ2_XS:
+          mul_mat_vec_iq2_xs_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00,
+                                      row_diff, stream);
+          break;
         default:
             GGML_ASSERT(false);
             break;
@@ -13523,11 +14045,9 @@ static void ggml_sycl_mul_mat(const ggml_tensor * src0, const ggml_tensor * src1
                 ggml_sycl_op_mul_mat(src0, src1, dst, ggml_sycl_op_dequantize_mul_mat_vec, false);
             }
         } else {
-            bool use_mul_mat_q = min_compute_capability >= VER_4VEC && ggml_is_quantized(src0->type);
-
-            if (use_xmx && min_compute_capability >= VER_GEN9 && src1->ne[1] > XMX_MAX_BATCH_SIZE) {
-                use_mul_mat_q = false;
-            }
+            bool use_mul_mat_q = use_xmx && min_compute_capability >= VER_4VEC &&
+                                ggml_is_quantized(src0->type) &&
+                                ggml_nrows(src1) == 1;
 
             if (use_mul_mat_q) {
                 // GGML_SYCL_DEBUG("ggml_sycl_mul_mat ggml_sycl_op_mul_mat_q path\n");
@@ -15049,14 +15569,11 @@ static bool ggml_backend_sycl_supports_op(ggml_backend_t backend, const ggml_ten
                 if (a->ne[3] != b->ne[3]) {
                     return false;
                 }
-
-                if (a->type == GGML_TYPE_IQ2_XXS) {
+                if (a->type == GGML_TYPE_IQ2_XXS || a->type == GGML_TYPE_IQ2_XS) {
+                  if (b->ne[1] == 1 && ggml_nrows(b) > 1) {
                     return false;
+                  }
                 }
-                if (a->type == GGML_TYPE_IQ2_XS) {
-                    return false;
-                }
-
                 return true;
             } break;
         case GGML_OP_GET_ROWS:
