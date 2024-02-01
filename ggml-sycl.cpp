@@ -9800,6 +9800,17 @@ static void mul_mat_vec_q6_K_q8_1_sycl(const void *vx, const void *vy,
         });
 }
 
+void print_memory(const void* data, size_t size) {
+    const char* byte = static_cast<const char*>(data);
+    for (size_t i = 0; i < size; ++i) {
+        printf("%X ", byte[i]);
+        if ((i + 1) % 16 == 0) {
+            printf("\n");
+        }
+    }
+    printf("\n");
+}
+
 static void mul_mat_vec_iq2_xxs_q8_1_sycl(const void *vx, const void *vy,
                                           float *dst, const int ncols,
                                           const int nrows,
@@ -9808,6 +9819,9 @@ static void mul_mat_vec_iq2_xxs_q8_1_sycl(const void *vx, const void *vy,
   const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
   const sycl::range<3> block_nums(1, 1, block_num_y);
   const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+  char vx_h[1024];
+  stream->memcpy(&vx_h, vx, 1024);
+  print_memory((void*)vx_h, 1024);
   stream->parallel_for(
       sycl::nd_range<3>(block_nums * block_dims, block_dims),
       [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(32)]] {
@@ -9824,6 +9838,9 @@ static void mul_mat_vec_iq2_xs_q8_1_sycl(const void *vx, const void *vy,
   const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
   const sycl::range<3> block_nums(1, 1, block_num_y);
   const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+  char vx_h[1024];
+  stream->memcpy(&vx_h, vx, 1024);
+  print_memory((void*)vx_h, 1024);
   stream->parallel_for(
       sycl::nd_range<3>(block_nums * block_dims, block_dims),
       [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(32)]] {
@@ -14039,8 +14056,10 @@ static void ggml_sycl_mul_mat(const ggml_tensor * src0, const ggml_tensor * src1
             if (use_mul_mat_vec_q) {
                 // NOTE: this kernel does not support ggml_nrows(src1) > 1
                 // GGML_SYCL_DEBUG("ggml_sycl_mul_mat ggml_sycl_op_mul_mat_vec_q path\n");
+                printf("1\n");
                 ggml_sycl_op_mul_mat(src0, src1, dst, ggml_sycl_op_mul_mat_vec_q, true);
             } else {
+                printf("2\n");
                 // GGML_SYCL_DEBUG("ggml_sycl_mul_mat ggml_sycl_op_dequantize_mul_mat_vec path\n");
                 ggml_sycl_op_mul_mat(src0, src1, dst, ggml_sycl_op_dequantize_mul_mat_vec, false);
             }
@@ -14050,9 +14069,11 @@ static void ggml_sycl_mul_mat(const ggml_tensor * src0, const ggml_tensor * src1
                                 ggml_nrows(src1) == 1;
 
             if (use_mul_mat_q) {
+              printf("3\n");
                 // GGML_SYCL_DEBUG("ggml_sycl_mul_mat ggml_sycl_op_mul_mat_q path\n");
                 ggml_sycl_op_mul_mat(src0, src1, dst, ggml_sycl_op_mul_mat_q, true);
             } else {
+              printf("4\n");
                 // GGML_SYCL_DEBUG("ggml_sycl_mul_mat ggml_sycl_op_mul_mat_sycl path\n");
                 ggml_sycl_op_mul_mat(src0, src1, dst, ggml_sycl_op_mul_mat_sycl, false);
             }
